@@ -4,11 +4,15 @@ Se levanta desde la raíz con:
     uvicorn api.app:app --reload --port 8000
 """
 
+import asyncio
+import hmac
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator, Literal
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import Body, FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -19,6 +23,51 @@ load_dotenv(RAIZ / ".env")
 from src.router.graph import construir_grafo  # noqa: E402
 
 logger = logging.getLogger("api.app")
+
+TELEGRAM_API = "https://api.telegram.org"
+TELEGRAM_TIMEOUT = 10.0
+
+
+def datos_de_update(update: Any) -> tuple[int | str, str] | None:
+    """Extrae (chat_id, texto) de un Update de Telegram.
+
+    Devuelve None si el update no trae un mensaje con texto y chat, por
+    ejemplo callbacks, mensajes editados o mensajes sin texto.
+    """
+    if not isinstance(update, dict):
+        return None
+
+    mensaje = update.get("message")
+    if not isinstance(mensaje, dict):
+        return None
+
+    texto = mensaje.get("text")
+    chat = mensaje.get("chat")
+    if not isinstance(texto, str) or not texto.strip():
+        return None
+    if not isinstance(chat, dict) or chat.get("id") is None:
+        return None
+
+    return chat["id"], texto
+
+
+async def enviar_mensaje_telegram(chat_id: int | str, texto: str) -> None:
+    """Envía un mensaje al chat usando la API HTTP de Telegram (httpx)."""
+    token = os.getenv("TELEGRAM_TOKEN", "").strip()
+    if not token:
+        logger.error(
+            "TELEGRAM_TOKEN no está configurado; no se pudo responder al chat %s.",
+            chat_id,
+        )
+        return
+
+    url = f"{TELEGRAM_API}/bot{token}/sendMessage"
+    async with httpx.AsyncClient(timeout=TELEGRAM_TIMEOUT) as cliente:
+        respuesta = await cliente.post(
+            url,
+            json={"chat_id": chat_id, "text": texto},
+        )
+        respuesta.raise_for_status()
 
 
 @asynccontextmanager
@@ -130,6 +179,13 @@ class ChatResponse(BaseModel):
     )
 
 
+class TelegramResponse(BaseModel):
+    ok: Literal[True] = Field(
+        True,
+        description="Telegram recibió el update. Siempre es true.",
+    )
+
+
 @app.get(
     "/health",
     tags=["salud"],
@@ -197,11 +253,54 @@ def chat(peticion: ChatRequest, request: Request) -> ChatResponse:
     "/telegram",
     tags=["telegram"],
     include_in_schema=False,
+    response_model=TelegramResponse,
     summary="Webhook de Telegram",
+    description=(
+        "Recibe los updates del bot, valida el secreto del webhook y responde "
+        "al chat con el resultado del router. Siempre devuelve 200 para que "
+        "Telegram no reintente el update."
+    ),
 )
 async def telegram(
-    payload: Annotated[Any, Body()] = None,
-) -> dict[str, bool]:
-    """Recibe las actualizaciones de Telegram (se completará más adelante)."""
-    _ = payload
-    return {"ok": True}
+    request: Request,
+    update: Annotated[Any, Body()] = None,
+) -> TelegramResponse:
+    """Procesa un Update de Telegram y responde por sendMessage."""
+    secreto = os.getenv("TELEGRAM_SECRET", "")
+    recibido = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+
+    if not secreto or not hmac.compare_digest(
+        recibido.encode("utf-8"), secreto.encode("utf-8")
+    ):
+        logger.warning(
+            "Webhook de Telegram rechazado: secreto ausente o incorrecto."
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="Secreto de Telegram inválido.",
+        )
+
+    datos = datos_de_update(update)
+    if datos is None:
+        # Updates sin texto (callbacks, stickers, mensajes editados...): se
+        # ignoran, pero Telegram recibe 200 para no reintentarlos.
+        return TelegramResponse(ok=True)
+
+    chat_id, texto = datos
+
+    try:
+        grafo = request.app.state.grafo
+        estado = await asyncio.to_thread(
+            grafo.invoke,
+            {"messages": [("user", texto)]},
+            {"configurable": {"thread_id": str(chat_id)}},
+        )
+        await enviar_mensaje_telegram(chat_id, estado["respuesta"])
+    except Exception:
+        # Telegram debe recibir 200 igualmente: si se devuelve un error,
+        # reintenta el mismo update y el usuario recibe mensajes duplicados.
+        logger.exception(
+            "Error al procesar el update de Telegram chat_id=%s", chat_id
+        )
+
+    return TelegramResponse(ok=True)
